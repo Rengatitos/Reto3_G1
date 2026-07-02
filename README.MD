@@ -1,10 +1,6 @@
 # CapyTown G1 — Reto LiDAR
 
 ## El Censo y el Guardián de las Cajas
-
-**ESAN — Robótica de Móviles 2026-I**
-Robot **Yahboom Pi5** · LiDAR **MS200** · **ROS2 Humble** · Docker
-
 ---
 
 ## Descripción
