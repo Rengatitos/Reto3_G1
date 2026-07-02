@@ -1,0 +1,24 @@
+# Parámetros del detector de cajas G1
+box_detector_G1:
+  ros__parameters:
+    # Clustering euclidiano
+    umbral_cluster: 0.12         # m  — distancia máxima entre puntos del mismo cluster
+    min_puntos: 4                # puntos mínimos para considerar un cluster válido
+
+    # Filtro por tamaño de caja
+    ancho_caja: 0.20             # m  — ancho nominal de la cara visible de la caja
+    tolerancia_ancho: 0.12       # m  — tolerancia ±  (acepta 0.08 … 0.32 m)
+
+    # Filtro angular (discrimina cajas de maderas/paredes laterales)
+    max_span_angular: 0.70       # rad — arco máximo para ser caja (~40°); paredes > 1 rad
+    min_span_angular: 0.04       # rad — arco mínimo para no ser ruido (~2°)
+    min_dist_caja: 0.10          # m   — distancia mínima aceptable al centroide
+
+    # Rango de detección
+    rango_max_deteccion: 3.5     # m  — ignora puntos más lejanos
+
+    # Deduplicación del censo
+    dist_duplicado: 0.28         # m  — dos detecciones < esto = misma caja
+
+    # Visualización consola
+    imprimir_cada: 5             # cada cuántos scans se imprime el plano 2D

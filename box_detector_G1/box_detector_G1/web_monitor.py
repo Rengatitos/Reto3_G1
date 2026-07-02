@@ -1,0 +1,844 @@
+#!/usr/bin/env python3
+"""
+web_monitor.py — Monitor web + orquestador de nodos  |  Puerto 8080
+
+Flujo de uso:
+  1. Solo este nodo arranca al inicio.
+  2. Boton "Iniciar escaneo"            -> lanza box_detector_G1 + behavior_fsm
+                                          en modo MEJORADO (gap nav) para no chocar
+                                          mientras el robot recorre la pista. (Parte A)
+  3. Con cajas detectadas, boton
+     "Activar recorrido mejorado"       -> deja los nodos activos, guarda inicio
+                                          en Neon DB y registra la corrida. (Parte B)
+  4. Boton "Detener"                    -> mata el proceso activo
+  5. Boton "Guardar corrida"            -> escribe Neon DB + SQLite + CSV
+
+Cambios v4:
+  - Parte A usa enhanced_mode=True para evitar colisiones durante el escaneo.
+  - Parte B guarda la corrida en Neon PostgreSQL (cloud) al presionar el boton.
+
+ESAN — Robotica de Moviles 2026-I  |  CapyTown Grupo 1
+"""
+
+import json
+import math
+import os
+import signal
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseArray
+from std_msgs.msg import String, Float32, Bool
+
+# — Rutas dentro del contenedor Docker ————————————————————————————————————
+_WS       = '/root/yahboomcar_ws'
+_SETUP    = f'{_WS}/install/setup.bash'
+_CFG_G1   = f'{_WS}/src/paquetes/box_detector_G1/config/params_G1.yaml'
+_CFG_FSM  = f'{_WS}/src/paquetes/behavior_fsm/config/params.yaml'
+
+def _ros2_run(package: str, executable: str, params_file: str | None = None,
+              extra_params: list[str] | None = None) -> subprocess.Popen:
+    """Lanza un nodo ROS2 como subproceso, heredando el entorno actual."""
+    cmd = ['ros2', 'run', package, executable]
+    if params_file:
+        cmd += ['--ros-args', '--params-file', params_file]
+    if extra_params:
+        cmd += ['--ros-args'] if '--ros-args' not in cmd else []
+        cmd += extra_params
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid,   # grupo de procesos propio para poder matar el arbol
+    )
+
+
+def _kill_proc(proc: subprocess.Popen | None):
+    """Mata el proceso y todos sus hijos."""
+    if proc is None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+# ——————————————————————————————————————————————————————————————————————————
+_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CapyTown G1 — Monitor Robot</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',system-ui,sans-serif;
+     height:100vh;display:flex;flex-direction:column;overflow:hidden}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:10px 18px;
+       display:flex;align-items:center;gap:12px;flex-shrink:0;flex-wrap:wrap}
+header h1{font-size:1.05rem;font-weight:700;color:#58a6ff}
+.badge{padding:3px 9px;border-radius:10px;font-size:.72rem;font-weight:700}
+.bg{background:#1f6feb22;color:#79c0ff;border:1px solid #1f6feb55}
+.gr{background:#3fb95022;color:#3fb950;border:1px solid #3fb95055}
+.rd{background:#f8514922;color:#f85149;border:1px solid #f8514955}
+.yl{background:#e3b34122;color:#e3b341;border:1px solid #e3b34155}
+#cs{margin-left:auto}
+.main{display:grid;grid-template-columns:1fr 340px;flex:1;overflow:hidden}
+.lp{display:flex;align-items:center;justify-content:center;background:#0a0d14;padding:10px}
+canvas{border-radius:8px;max-width:100%;max-height:100%}
+.ip{background:#161b22;border-left:1px solid #30363d;display:flex;flex-direction:column;overflow-y:auto}
+.sec{padding:12px 14px;border-bottom:1px solid #21262d}
+.sec h2{font-size:.7rem;font-weight:700;color:#8b949e;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.btn-row{display:flex;flex-direction:column;gap:7px}
+.btn{padding:9px 14px;border-radius:7px;font-size:.82rem;font-weight:700;cursor:pointer;
+     border:1px solid transparent;transition:all .2s;display:flex;align-items:center;gap:8px;justify-content:center}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn-green{background:#238636;color:#fff;border-color:#2ea043}
+.btn-green:hover:not(:disabled){background:#2ea043}
+.btn-red{background:#b62324;color:#fff;border-color:#cf2222}
+.btn-red:hover:not(:disabled){background:#cf2222}
+.btn-purple{background:#6e40c9;color:#fff;border-color:#8957e5}
+.btn-purple:hover:not(:disabled){background:#8957e5}
+.btn-orange{background:#9a6700;color:#fff;border-color:#d29922}
+.btn-orange:hover:not(:disabled){background:#d29922}
+.btn-gray{background:#21262d;color:#c9d1d9;border-color:#30363d}
+.btn-gray:hover:not(:disabled){background:#30363d}
+#phase-box{margin-top:8px;padding:8px 10px;border-radius:6px;font-size:.75rem;font-weight:600;text-align:center}
+.ph-idle{background:#21262d;color:#8b949e}
+.ph-a{background:#1f6feb22;color:#79c0ff;border:1px solid #1f6feb55}
+.ph-b{background:#6e40c922;color:#d2a8ff;border:1px solid #8957e555}
+.ph-done{background:#3fb95022;color:#3fb950;border:1px solid #3fb95055}
+.fsm-row{display:flex;align-items:center;gap:10px}
+.dot{width:11px;height:11px;border-radius:50%;flex-shrink:0}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.pulse{animation:pulse 1.4s infinite}
+.fsm-name{font-size:1.3rem;font-weight:800}
+.sg{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:2px}
+.sc{background:#21262d;border-radius:6px;padding:9px 10px}
+.sl{font-size:.65rem;color:#8b949e;margin-bottom:3px}
+.sv{font-size:1rem;font-weight:700}
+.met{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.mc{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:7px 9px}
+.ml{font-size:.63rem;color:#8b949e;margin-bottom:2px}
+.mv{font-size:.88rem;font-weight:700}
+.bl{display:flex;flex-direction:column;gap:5px}
+.bi{background:#21262d;border-radius:6px;padding:9px 11px;border-left:3px solid #1f6feb;
+    display:grid;grid-template-columns:26px 1fr;gap:8px;align-items:center}
+.bn{background:#1f6feb;color:#fff;border-radius:4px;width:26px;height:26px;
+    display:flex;align-items:center;justify-content:center;font-size:.72rem;font-weight:800}
+.bc{font-size:.72rem;color:#8b949e;line-height:1.5}
+.bc span{color:#e6edf3;font-weight:600}
+.nb{color:#8b949e;font-size:.82rem;text-align:center;padding:18px}
+footer{background:#161b22;border-top:1px solid #30363d;padding:5px 18px;
+       font-size:.68rem;color:#8b949e;display:flex;justify-content:space-between;flex-shrink:0}
+#toast{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);
+       background:#238636;color:#fff;padding:8px 22px;border-radius:20px;
+       font-size:.82rem;font-weight:700;opacity:0;transition:opacity .3s;pointer-events:none;z-index:99}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#128916; CapyTown G1 &mdash; Monitor Robot</h1>
+  <span class="badge bg">ESAN Rob&oacute;tica 2026&#8209;I</span>
+  <span id="cs" class="badge rd">&#9679; Sin conexi&oacute;n</span>
+</header>
+<div class="main">
+  <div class="lp"><canvas id="C" width="560" height="560"></canvas></div>
+  <div class="ip">
+
+    <!-- CONTROL -->
+    <div class="sec">
+      <h2>Control de fases</h2>
+      <div class="btn-row">
+        <button id="btnA" class="btn btn-green" onclick="cmdStart()">
+          &#128269; Iniciar escaneo &nbsp;<small>(Parte A &mdash; nav. mejorada)</small>
+        </button>
+        <button id="btnB" class="btn btn-purple" onclick="cmdEnhanced()" disabled
+                title="Escanea la pista primero y detecta al menos 1 caja">
+          &#9889; Activar Parte B &nbsp;<small>(guarda en Neon DB &#9729;)</small>
+        </button>
+        <button id="btnStop" class="btn btn-red" onclick="cmdStop()" disabled>
+          &#9632; Detener fase activa
+        </button>
+        <button id="btnSave" class="btn btn-gray" onclick="cmdSave()">
+          &#128190; Guardar corrida (Neon DB + CSV)
+        </button>
+      </div>
+      <div id="phase-box" class="ph-idle">En espera — presiona "Iniciar escaneo"</div>
+    </div>
+
+    <!-- FSM -->
+    <div class="sec">
+      <h2>Estado FSM</h2>
+      <div class="fsm-row">
+        <div id="fd" class="dot pulse" style="background:#8b949e"></div>
+        <div id="fn" class="fsm-name" style="color:#8b949e">—</div>
+      </div>
+      <div id="pi" style="margin-top:7px;font-size:.78rem;color:#8b949e;display:none">
+        Dist. parada: <span id="pd" style="color:#f85149;font-weight:700">--</span> m
+      </div>
+    </div>
+
+    <!-- STATS -->
+    <div class="sec">
+      <h2>Estad&iacute;sticas en vivo</h2>
+      <div class="sg">
+        <div class="sc"><div class="sl">Cajas Censadas</div><div id="sb" class="sv" style="color:#58a6ff">0</div></div>
+        <div class="sc"><div class="sl">Dist. Frente</div><div id="sd" class="sv">&mdash;</div></div>
+        <div class="sc"><div class="sl">Pts LiDAR</div><div id="sp" class="sv">&mdash;</div></div>
+        <div class="sc"><div class="sl">Refresco</div><div id="sf" class="sv">&mdash; Hz</div></div>
+      </div>
+    </div>
+
+    <!-- METRICAS -->
+    <div class="sec">
+      <h2>M&eacute;tricas de corrida (Parte B)</h2>
+      <div class="met">
+        <div class="mc"><div class="ml">Rodeos OK/Total</div><div id="mro" class="mv">—</div></div>
+        <div class="mc"><div class="ml">Colisiones</div><div id="mcol" class="mv">—</div></div>
+        <div class="mc"><div class="ml">Dist. min parada</div><div id="mdp" class="mv">—</div></div>
+        <div class="mc"><div class="ml">Tasa rodeo</div><div id="mtr" class="mv">—</div></div>
+        <div class="mc" style="grid-column:span 2;border-color:#8957e5">
+          <div class="ml">Vueltas completadas</div>
+          <div id="mvueltas" class="mv" style="font-size:1.3rem;color:#d2a8ff">0 / —</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CENSO -->
+    <div class="sec" style="flex:1">
+      <h2>Censo de Cajas</h2>
+      <div id="bl" class="bl"><div class="nb">Inicia el escaneo para detectar cajas&hellip;</div></div>
+    </div>
+  </div>
+</div>
+<footer>
+  <span>Fase A: /cajas_G1 &middot; /scan &nbsp;|&nbsp; Fase B: /fsm_state &middot; /fsm_metrics &middot; Neon DB &#9729;</span>
+  <span id="lu">&mdash;</span>
+</footer>
+<div id="toast"></div>
+
+<script>
+const cv=document.getElementById('C'),ctx=cv.getContext('2d');
+const W=cv.width,H=cv.height,CX=W/2,CY=H/2,SC=78;
+let fps=0,prevT=null;
+// phase: 'idle' | 'scanning' | 'running'
+let phase='idle';
+
+const FC={
+  'CRUCERO':'#3fb950','CAJA_DETECTADA':'#e3b341','PARAR':'#f85149',
+  'ESPERAR_3S':'#f0883e','RODEAR':'#79c0ff','CRUCERO_M':'#3fb950',
+  'PARAR_M':'#f85149','EVADIR_M':'#e3b341'
+};
+
+function showToast(msg,color='#238636'){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.style.background=color;t.style.opacity='1';
+  setTimeout(()=>t.style.opacity='0',2800);
+}
+async function apiPost(path){
+  try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    return await r.json();}
+  catch{showToast('Error de red','#b62324');return null;}
+}
+
+function setPhaseUI(p){
+  phase=p;
+  const pb=document.getElementById('phase-box');
+  const btnA=document.getElementById('btnA');
+  const btnB=document.getElementById('btnB');
+  const btnStop=document.getElementById('btnStop');
+  if(p==='idle'){
+    pb.className='ph-idle';pb.textContent='En espera — presiona "Iniciar escaneo"';
+    btnA.disabled=false;btnB.disabled=true;btnStop.disabled=true;
+  }else if(p==='scanning'){
+    pb.className='ph-a';pb.textContent='FASE A activa — escaneando en modo mejorado (sin colisiones)...';
+    btnA.disabled=true;btnB.disabled=true;btnStop.disabled=false;
+  }else if(p==='running'){
+    pb.className='ph-b';pb.textContent='FASE B activa — corrida registrada en Neon DB ☁';
+    btnA.disabled=true;btnB.disabled=true;btnStop.disabled=false;
+  }else if(p==='done'){
+    pb.className='ph-done';pb.textContent='Recorrido completado. Guarda la corrida.';
+    btnA.disabled=false;btnB.disabled=true;btnStop.disabled=true;
+  }
+}
+
+async function cmdStart(){
+  const d=await apiPost('/api/start');
+  if(d&&d.ok){setPhaseUI('scanning');showToast('Parte A — escaneo con nav. mejorada (sin colisiones)');}
+}
+async function cmdStop(){
+  const d=await apiPost('/api/stop');
+  if(d&&d.ok){setPhaseUI('idle');showToast('Fase detenida','#b62324');}
+}
+async function cmdEnhanced(){
+  const d=await apiPost('/api/enhanced');
+  if(d&&d.ok){setPhaseUI('running');showToast('Parte B activa — corrida registrada en Neon DB ☁','#6e40c9');}
+  else showToast('Necesitas cajas detectadas primero','#b62324');
+}
+async function cmdSave(){
+  const d=await apiPost('/api/save_run');
+  if(d&&d.ok)showToast('Corrida #'+d.run_id+' guardada'+(d.neon_id>0?' en Neon DB ☁':' local'));
+  else showToast('Error al guardar','#b62324');
+}
+
+function odom2robot(bx,by,rx,ry,ryaw){
+  const dx=bx-rx,dy=by-ry,c=Math.cos(ryaw),s=Math.sin(ryaw);
+  return{x:c*dx+s*dy,y:-s*dx+c*dy};}
+function toCv(rx,ry){return{px:CX-ry*SC,py:CY-rx*SC};}
+
+function drawGrid(){
+  // Relleno de zonas
+  // ALERTA (15-30 cm) — amarillo muy tenue
+  ctx.beginPath();ctx.arc(CX,CY,.30*SC,0,Math.PI*2);
+  ctx.fillStyle='rgba(227,179,65,.06)';ctx.fill();
+  // PELIGRO (<15 cm) — rojo muy tenue
+  ctx.beginPath();ctx.arc(CX,CY,.15*SC,0,Math.PI*2);
+  ctx.fillStyle='rgba(248,81,73,.10)';ctx.fill();
+
+  // Anillos de distancia
+  [.5,1,1.5,2,2.5,3,3.5].forEach(d=>{
+    ctx.beginPath();ctx.arc(CX,CY,d*SC,0,Math.PI*2);
+    ctx.strokeStyle='#1c2133';ctx.lineWidth=1;ctx.stroke();
+    ctx.fillStyle='#35405a';ctx.font='10px system-ui';
+    ctx.fillText(d.toFixed(1)+'m',CX+3,CY-d*SC+11);});
+  // Azimuts
+  for(let g=0;g<360;g+=30){
+    const r=(g-90)*Math.PI/180;
+    ctx.beginPath();ctx.moveTo(CX,CY);ctx.lineTo(CX+Math.cos(r)*3.5*SC,CY+Math.sin(r)*3.5*SC);
+    ctx.strokeStyle='#181d2a';ctx.lineWidth=1;ctx.stroke();}
+
+  // Anillo PELIGRO 15 cm — rojo sólido
+  ctx.setLineDash([4,3]);
+  ctx.strokeStyle='rgba(248,81,73,.80)';ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(CX,CY,.15*SC,0,Math.PI*2);ctx.stroke();
+  ctx.fillStyle='rgba(248,81,73,.7)';ctx.font='bold 9px system-ui';
+  ctx.fillText('PARAR 15cm',CX+.15*SC+3,CY-3);
+
+  // Anillo ALERTA 30 cm — amarillo sólido
+  ctx.strokeStyle='rgba(227,179,65,.80)';ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.arc(CX,CY,.30*SC,0,Math.PI*2);ctx.stroke();
+  ctx.fillStyle='rgba(227,179,65,.7)';ctx.font='bold 9px system-ui';
+  ctx.fillText('ALERTA 30cm',CX+.30*SC+3,CY-3);
+
+  // Sector frontal ±45°
+  ctx.setLineDash([2,4]);ctx.strokeStyle='rgba(88,166,255,.20)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(CX,CY);
+  ctx.arc(CX,CY,3.5*SC,-Math.PI/2-Math.PI/4,-Math.PI/2+Math.PI/4);
+  ctx.lineTo(CX,CY);ctx.stroke();
+  ctx.setLineDash([]);ctx.lineWidth=1;}
+
+// Zonas de distancia (deben coincidir con params.yaml)
+const D_PARADA  = 0.15;  // m  — rojo
+const D_ALERTA  = 0.30;  // m  — amarillo
+
+function zoneColor(r){
+  if(r < D_PARADA)  return '#f85149';          // PELIGRO  — rojo
+  if(r < D_ALERTA){                             // ALERTA   — degradado rojo-amarillo
+    const t=(r-D_PARADA)/(D_ALERTA-D_PARADA);  // 0=parada, 1=alerta
+    const R=Math.round(248-248*t+227*t);        // 248-227
+    const G=Math.round(81+179*t*t);             // 81-179 (cuadrático)
+    return `rgb(${R},${G},50)`;}
+  // SEGURO — degradado amarillo-verde — verde puro
+  const t=Math.min(1,(r-D_ALERTA)/1.5);        // 0 en 30cm, 1 en 1.8m
+  const R=Math.round(227*(1-t)+63*t);           // 227-63
+  const G=Math.round(179*(1-t)+185*t);          // 179-185
+  return `rgb(${R},${G},80)`;}
+
+function drawScan(scan){
+  if(!scan||!scan.ranges)return 0;
+  const{ranges,angle_min,angle_increment,range_max}=scan;
+  const rmax=Math.min(range_max||30,3.5);let pts=[];
+  for(let i=0;i<ranges.length;i++){
+    const r=ranges[i];
+    if(r===null||!isFinite(r)||r<=0.01||r>rmax)continue;
+    const th=angle_min+i*angle_increment;
+    pts.push({x:r*Math.cos(th),y:r*Math.sin(th),r});}
+  // Polígono de área libre (fondo azul tenue)
+  if(pts.length>1){
+    ctx.beginPath();const{px:p0x,py:p0y}=toCv(pts[0].x,pts[0].y);ctx.moveTo(p0x,p0y);
+    pts.forEach(p=>{const{px,py}=toCv(p.x,p.y);ctx.lineTo(px,py);});
+    ctx.closePath();ctx.fillStyle='rgba(31,111,235,.06)';ctx.fill();}
+  // Puntos coloreados por zona
+  pts.forEach(p=>{
+    const{px,py}=toCv(p.x,p.y);
+    ctx.beginPath();ctx.arc(px,py,2.2,0,Math.PI*2);
+    ctx.fillStyle=zoneColor(p.r);ctx.fill();});
+  return pts.length;}
+
+function drawBoxes(boxes,pose){
+  if(!boxes||!boxes.length)return;
+  const{x:rx,y:ry,yaw:ryaw}=pose;
+  boxes.forEach((b,i)=>{
+    const rb=odom2robot(b.x,b.y,rx,ry,ryaw);
+    if(Math.hypot(rb.x,rb.y)>3.7)return;
+    const{px,py}=toCv(rb.x,rb.y);const pr=Math.max((b.r||.1)*SC,8);
+    ctx.beginPath();ctx.arc(px,py,pr,0,Math.PI*2);
+    ctx.fillStyle='rgba(0,210,255,.12)';ctx.fill();
+    ctx.strokeStyle='rgba(0,210,255,.85)';ctx.lineWidth=1.5;ctx.stroke();
+    ctx.strokeStyle='#00d2ff';ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(px-5,py);ctx.lineTo(px+5,py);
+    ctx.moveTo(px,py-5);ctx.lineTo(px,py+5);ctx.stroke();
+    ctx.fillStyle='#00d2ff';ctx.font='bold 11px system-ui';
+    ctx.fillText('C'+String(i+1).padStart(2,'0'),px+pr+4,py);
+    ctx.fillStyle='rgba(0,210,255,.6)';ctx.font='9px system-ui';
+    ctx.fillText('('+b.x.toFixed(2)+','+b.y.toFixed(2)+')',px+pr+4,py+12);});}
+
+function drawRobot(state){
+  const col=(phase==='idle')?'#8b949e':(FC[state]||'#8b949e');const S=13;
+  ctx.save();ctx.translate(CX,CY);
+  ctx.beginPath();ctx.arc(0,0,S,0,Math.PI*2);
+  ctx.fillStyle=col+'30';ctx.fill();ctx.strokeStyle=col;ctx.lineWidth=2;ctx.stroke();
+  ctx.fillStyle=col;ctx.beginPath();ctx.moveTo(0,-(S+7));ctx.lineTo(-5,-(S-4));ctx.lineTo(5,-(S-4));ctx.closePath();ctx.fill();
+  ctx.restore();}
+
+function render(data){
+  ctx.clearRect(0,0,W,H);ctx.fillStyle='#080b10';ctx.fillRect(0,0,W,H);
+  drawGrid();const pts=drawScan(data.scan)||0;
+  const pose=data.robot_pose||{x:0,y:0,yaw:0};
+  drawBoxes(data.boxes,pose);drawRobot(data.fsm_state||'—');
+  return pts;}
+
+function updatePanel(data,pts){
+  const st=data.fsm_state;
+  const met=data.metrics||{};
+  const col=FC[st]||'#8b949e';
+  document.getElementById('fd').style.background=col;
+  document.getElementById('fn').style.color=col;
+  document.getElementById('fn').textContent=st||'—';
+  const piEl=document.getElementById('pi');
+  if(data.parada_dist!=null){document.getElementById('pd').textContent=data.parada_dist.toFixed(3);piEl.style.display='block';}
+  else piEl.style.display='none';
+  const boxes=data.boxes||[];const nCajas=boxes.length;
+  document.getElementById('sb').textContent=nCajas;
+  const df=data.dist_frente;
+  document.getElementById('sd').textContent=(df!=null&&isFinite(df))?df.toFixed(2)+' m':'—';
+  document.getElementById('sp').textContent=pts;
+  document.getElementById('sf').textContent=fps.toFixed(1)+' Hz';
+  // Habilitar Parte B cuando hay cajas y fase es scanning
+  if(phase==='scanning'&&nCajas>0)document.getElementById('btnB').disabled=false;
+  if(phase==='running'||Object.keys(met).length>0){
+    document.getElementById('mro').textContent=(met.rodeos_exitosos||0)+' / '+(met.rodeos_completados||0);
+    const nc=met.colisiones||0;
+    document.getElementById('mcol').textContent=nc;
+    document.getElementById('mcol').style.color=nc>0?'#f85149':'#3fb950';
+    document.getElementById('mdp').textContent=met.dist_min_parada_cm!=null?(met.dist_min_parada_cm.toFixed(1)+' cm'):'—';
+    document.getElementById('mtr').textContent=met.tasa_rodeo!=null?((met.tasa_rodeo*100).toFixed(0)+'%'):'—';
+    const nv=met.vueltas??0; const maxv=met.num_vueltas??1;
+    document.getElementById('mvueltas').textContent=nv+' / '+(maxv===0?'∞':maxv);
+    // Auto-guardar y notificar cuando el recorrido termina
+    if(met.recorrido_done&&phase==='running'){
+      setPhaseUI('done');
+      showToast('¡Recorrido completo! '+nv+' vuelta(s). Guardando…','#6e40c9');
+      setTimeout(()=>cmdSave(),1500);
+    }
+  }
+  const bl=document.getElementById('bl');
+  if(!boxes.length)bl.innerHTML='<div class="nb">Sin cajas censadas aún…</div>';
+  else bl.innerHTML=boxes.map((b,i)=>
+    '<div class="bi"><div class="bn">'+(i+1)+'</div><div>'+
+    '<div class="bc">X:<span>'+b.x.toFixed(3)+'</span>m &nbsp; Y:<span>'+b.y.toFixed(3)+'</span>m</div>'+
+    '<div class="bc">Radio:<span>'+(b.r||0).toFixed(3)+'</span>m</div></div></div>').join('');
+  // Si la FSM reporta fin de recorrido y estamos en fase B
+  if(phase==='running'&&met.recorrido_done)
+    setPhaseUI('done');
+  document.getElementById('lu').textContent='Actualizado: '+new Date().toLocaleTimeString();}
+
+async function poll(){
+  try{const r=await fetch('/api/data',{signal:AbortSignal.timeout(700)});
+    if(!r.ok)throw 0;const d=await r.json();
+    const now=performance.now();
+    if(prevT!==null)fps=.2*(1000/(now-prevT))+.8*fps;prevT=now;
+    const pts=render(d);updatePanel(d,pts);
+    document.getElementById('cs').textContent='● Conectado';
+    document.getElementById('cs').className='badge gr';
+  }catch{document.getElementById('cs').textContent='● Sin conexión';
+    document.getElementById('cs').className='badge rd';}
+  setTimeout(poll,150);}
+
+drawGrid();drawRobot('—');poll();
+</script></body></html>"""
+
+
+class _Handler(BaseHTTPRequestHandler):
+    node_ref: 'WebMonitorNode' = None
+
+    def do_GET(self):
+        if self.path == '/':
+            body = _HTML.encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == '/api/data':
+            data = self.node_ref._get_state_json() if self.node_ref else '{}'
+            body = data.encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404); self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        self.rfile.read(length) if length else None
+        result = {'ok': False}
+        if   self.path == '/api/start':    result = self.node_ref._cmd_start()    if self.node_ref else result
+        elif self.path == '/api/stop':     result = self.node_ref._cmd_stop()     if self.node_ref else result
+        elif self.path == '/api/enhanced': result = self.node_ref._cmd_enhanced() if self.node_ref else result
+        elif self.path == '/api/save_run': result = self.node_ref._cmd_save_run() if self.node_ref else result
+        body = json.dumps(result).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class WebMonitorNode(Node):
+
+    def __init__(self):
+        super().__init__('web_monitor')
+        self.declare_parameter('port', 8080)
+        self.declare_parameter('max_scan_pts', 400)
+        self.declare_parameter('sector_frontal_deg', 45.0)
+        self.declare_parameter('cajas_reales', 5)
+
+        self._port     = self.get_parameter('port').value
+        self._max_pts  = int(self.get_parameter('max_scan_pts').value)
+        self._sector   = math.radians(self.get_parameter('sector_frontal_deg').value)
+        self._cajas_gt = int(self.get_parameter('cajas_reales').value)
+
+        self._lock          = threading.Lock()
+        self._scan          = None
+        self._boxes         = []
+        self._fsm_state     = None
+        self._parada_dist   = None
+        self._pose          = (0.0, 0.0, 0.0)
+        self._dist_frente   = float('inf')
+        self._metrics       = {}
+        self._neon_run_id   = None  # ID de la corrida actual en Neon DB
+
+        # — Neon DB ————————————————————————————————————————————————————
+        try:
+            from box_detector_G1.neon_manager import NeonRunDB
+            self._neon = NeonRunDB()
+            threading.Thread(
+                target=self._neon_ping_log, daemon=True).start()
+        except Exception as exc:
+            self.get_logger().error(f'[NeonDB] No se pudo inicializar: {exc}')
+            self._neon = None
+
+        # — Subprocesos ————————————————————————————————————————————————
+        # Fase A: box_detector_G1 + behavior_fsm + wall_follower (movimiento)
+        # Fase B: mismos nodos, solo cambia enhanced_mode
+        self._procs: list[subprocess.Popen] = []
+
+        _qos = QoSProfile(depth=10)
+        _qos.reliability = ReliabilityPolicy.BEST_EFFORT
+
+        self.create_subscription(LaserScan, '/scan',        self._cb_scan,    _qos)
+        self.create_subscription(Odometry,  '/odom',        self._cb_odom,    10)
+        self.create_subscription(PoseArray, '/cajas_G1',    self._cb_boxes,   10)
+        self.create_subscription(String,    '/fsm_state',   self._cb_fsm,     10)
+        self.create_subscription(Float32,   '/parada_dist', self._cb_parada,  10)
+        self.create_subscription(String,    '/fsm_metrics', self._cb_metrics, 10)
+
+        # Publicadores de control para behavior_fsm
+        self._pub_active   = self.create_publisher(Bool, '/scan_active',   10)
+        self._pub_enhanced = self.create_publisher(Bool, '/enhanced_mode', 10)
+
+        _Handler.node_ref = self
+        self._server = HTTPServer(('0.0.0.0', self._port), _Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+        ip = self._get_local_ip()
+        self.get_logger().info(
+            f'WebMonitor listo\n'
+            f'  http://{ip}:{self._port}\n'
+            f'  http://localhost:{self._port}\n'
+            f'  Fase A (escaneo) y Fase B (recorrido) se activan desde la web.')
+
+    # — Comandos de fase ————————————————————————————————————————————————
+
+    def _cmd_start(self) -> dict:
+        """Fase A: lanza box_detector_G1 + behavior_fsm + wall_follower.
+
+        Usa FSM MEJORADA (CRUCERO_M -> PARAR_M -> EVADIR_M, giro continuo
+        hasta despejar el frente) para minimizar colisiones mientras el
+        robot censa la pista.
+        """
+        self._kill_all()
+        self._neon_run_id = None
+        try:
+            p_det = _ros2_run('box_detector_G1', 'box_detector_G1', params_file=_CFG_G1)
+            p_fsm = _ros2_run('behavior_fsm',    'behavior_fsm',    params_file=_CFG_FSM)
+            p_wf  = _ros2_run('behavior_fsm',    'wall_follower',   params_file=_CFG_FSM)
+            self._procs = [p_det, p_fsm, p_wf]
+            self.get_logger().info(
+                f'[Fase A] PIDs — detector={p_det.pid}  fsm={p_fsm.pid}  wf={p_wf.pid}')
+            def _activar():
+                time.sleep(1.5)
+                # Asegurar modo MEJORADO (enhanced_mode=True)
+                enh = Bool(); enh.data = True
+                self._pub_enhanced.publish(enh)
+                time.sleep(0.1)
+                act = Bool(); act.data = True
+                self._pub_active.publish(act)
+                self.get_logger().info(
+                    '[Fase A] enhanced_mode=True + scan_active=True '
+                    '-> FSM MEJORADA (CRUCERO_M-PARAR_M-EVADIR_M) — censando pista')
+            threading.Thread(target=_activar, daemon=True).start()
+            return {'ok': True}
+        except Exception as e:
+            self.get_logger().error(f'[Fase A] Error al lanzar: {e}')
+            return {'ok': False, 'msg': str(e)}
+
+    def _cmd_stop(self) -> dict:
+        """Detiene todos los procesos activos y frena el robot."""
+        # Frenar primero
+        stop = Bool(); stop.data = False
+        self._pub_active.publish(stop)
+        self._kill_all()
+        self.get_logger().info('[WebMonitor] Fase detenida por usuario')
+        return {'ok': True}
+
+    def _cmd_enhanced(self) -> dict:
+        """Fase B: los nodos ya corren desde Fase A en modo mejorado.
+
+        El robot ya está usando gap-navigation desde la Fase A.
+        Al presionar Parte B:
+          1. Se registra el inicio de corrida en Neon DB (cloud).
+          2. Se registra la posición de inicio para contar vueltas.
+          3. La FSM ya está en CRUCERO_M — no cambia el modo.
+
+        Si los nodos no están corriendo, los lanza también.
+        """
+        with self._lock:
+            n = len(self._boxes)
+        if n == 0:
+            self.get_logger().warn('[Fase B] Sin cajas detectadas — rechazado')
+            return {'ok': False, 'msg': 'no_boxes'}
+        # Si por alguna razón los nodos no están corriendo, lanzarlos
+        if not self._procs:
+            try:
+                p_fsm = _ros2_run('behavior_fsm', 'behavior_fsm', params_file=_CFG_FSM)
+                p_wf  = _ros2_run('behavior_fsm', 'wall_follower', params_file=_CFG_FSM)
+                self._procs += [p_fsm, p_wf]
+                def _activar_b():
+                    time.sleep(1.5)
+                    enh_msg = Bool(); enh_msg.data = True
+                    self._pub_enhanced.publish(enh_msg)
+                    time.sleep(0.1)
+                    act_msg = Bool(); act_msg.data = True
+                    self._pub_active.publish(act_msg)
+                threading.Thread(target=_activar_b, daemon=True).start()
+            except Exception as e:
+                return {'ok': False, 'msg': str(e)}
+        else:
+            # Ya corren en modo mejorado — solo asegurar enhanced_mode=True
+            msg = Bool(); msg.data = True
+            self._pub_enhanced.publish(msg)
+
+        # Guardar inicio de corrida en Neon DB en segundo plano
+        with self._lock:
+            boxes_snap = list(self._boxes)
+            met_snap   = dict(self._metrics)
+
+        def _registrar_inicio():
+            if self._neon is None:
+                self.get_logger().warn('[Fase B] Neon DB no disponible — sin registro cloud')
+                return
+            try:
+                run_id = self._neon.save_run({
+                    'cajas_reales':       self._cajas_gt,
+                    'cajas_detectadas':   len(boxes_snap),
+                    'error_pos_prom_cm':  0.0,
+                    'dist_min_parada_cm': 0.0,
+                    'colisiones':         0,
+                    'rodeo_exitoso':      0,
+                    'vueltas':            0,
+                    'cajas_pos':          [(b['x'], b['y'], b.get('r', 0.1)) for b in boxes_snap],
+                })
+                with self._lock:
+                    self._neon_run_id = run_id
+                self.get_logger().info(
+                    f'[Fase B] Corrida #{run_id} registrada en Neon DB  '
+                    f'({len(boxes_snap)} cajas detectadas)')
+            except Exception as exc:
+                self.get_logger().error(f'[Fase B] Error Neon DB: {exc}')
+
+        threading.Thread(target=_registrar_inicio, daemon=True).start()
+
+        self.get_logger().info(
+            f'[Fase B] Recorrido mejorado activo  ({n} cajas en censo)')
+        return {'ok': True}
+
+    def _cmd_save_run(self) -> dict:
+        """Guarda la corrida actual en Neon DB (cloud) + SQLite + CSV."""
+        with self._lock:
+            boxes = list(self._boxes); met = dict(self._metrics)
+            neon_run_id = self._neon_run_id
+
+        run_data = {
+            'cajas_reales':       self._cajas_gt,
+            'cajas_detectadas':   len(boxes),
+            'error_pos_prom_cm':  0.0,
+            'dist_min_parada_cm': met.get('dist_min_parada_cm', 0.0),
+            'colisiones':         met.get('colisiones', 0),
+            'rodeo_exitoso':      met.get('rodeos_exitosos', 0),
+            'vueltas':            met.get('vueltas', 0),
+            'cajas_pos':          [(b['x'], b['y'], b.get('r', 0.1)) for b in boxes],
+        }
+
+        # — Neon DB (cloud) ————————————————————————————————————————————
+        neon_id = -1
+        if self._neon is not None:
+            try:
+                if neon_run_id is not None:
+                    # Actualizar la corrida ya registrada al inicio de Parte B
+                    neon_id = neon_run_id
+                    self.get_logger().info(
+                        f'[Guardar] Corrida Neon #{neon_id} ya existe (Parte B)')
+                else:
+                    neon_id = self._neon.save_run(run_data)
+                    self.get_logger().info(
+                        f'[Guardar] Corrida #{neon_id} guardada en Neon DB')
+            except Exception as exc:
+                self.get_logger().error(f'[Guardar] Error Neon DB: {exc}')
+
+        # — SQLite local (respaldo) ———————————————————————————————————
+        local_id = -1
+        try:
+            from box_detector.db_manager import RunDB
+            db = RunDB()
+            local_id = db.save_run(run_data)
+            self.get_logger().info(f'[Guardar] Corrida #{local_id} guardada en SQLite')
+        except Exception as exc:
+            self.get_logger().warn(f'[Guardar] SQLite no disponible: {exc}')
+
+        final_id = neon_id if neon_id > 0 else local_id
+        return {'ok': final_id > 0, 'run_id': final_id, 'neon_id': neon_id}
+
+    def _neon_ping_log(self):
+        """Verifica conectividad con Neon DB al arrancar."""
+        try:
+            ok = self._neon.ping()
+            total = self._neon.count_runs() if ok else -1
+            if ok:
+                self.get_logger().info(
+                    f'[NeonDB] Conectado — corridas totales={total}')
+            else:
+                self.get_logger().warn('[NeonDB] Sin conexión — modo respaldo SQLite')
+        except Exception as exc:
+            self.get_logger().warn(f'[NeonDB] Ping fallido: {exc}')
+
+    def _kill_all(self):
+        for p in self._procs:
+            _kill_proc(p)
+        self._procs = []
+
+    # — Callbacks —————————————————————————————————————————————————————————
+
+    def _cb_scan(self, msg: LaserScan):
+        n = len(msg.ranges); step = max(1, n // self._max_pts)
+        reduced = []; d_f = float('inf')
+        for i in range(0, n, step):
+            r = msg.ranges[i]
+            theta = msg.angle_min + i * msg.angle_increment
+            af = math.atan2(math.sin(theta), math.cos(theta))
+            if abs(af) <= self._sector and math.isfinite(r) and msg.range_min <= r <= msg.range_max:
+                d_f = min(d_f, r)
+            reduced.append(round(r, 3) if math.isfinite(r) else None)
+        with self._lock:
+            self._scan = {'ranges': reduced,
+                          'angle_min': round(msg.angle_min, 5),
+                          'angle_increment': round(msg.angle_increment * step, 6),
+                          'range_max': round(msg.range_max, 2)}
+            self._dist_frente = d_f
+
+    def _cb_odom(self, msg: Odometry):
+        p = msg.pose.pose.position; q = msg.pose.pose.orientation
+        siny = 2.0*(q.w*q.z + q.x*q.y); cosy = 1.0 - 2.0*(q.y**2 + q.z**2)
+        with self._lock: self._pose = (p.x, p.y, math.atan2(siny, cosy))
+
+    def _cb_boxes(self, msg: PoseArray):
+        boxes = [{'x': round(p.position.x, 4), 'y': round(p.position.y, 4), 'r': 0.10}
+                 for p in msg.poses]
+        with self._lock: self._boxes = boxes
+
+    def _cb_fsm(self, msg: String):
+        with self._lock: self._fsm_state = msg.data
+
+    def _cb_parada(self, msg: Float32):
+        with self._lock: self._parada_dist = round(float(msg.data), 4)
+
+    def _cb_metrics(self, msg: String):
+        try:
+            with self._lock: self._metrics = json.loads(msg.data)
+        except Exception: pass
+
+    # — JSON de estado ————————————————————————————————————————————————————
+
+    def _get_state_json(self) -> str:
+        with self._lock:
+            scan = self._scan; boxes = list(self._boxes); fsm = self._fsm_state
+            pd = self._parada_dist; px, py, pyaw = self._pose
+            df = self._dist_frente; met = dict(self._metrics)
+        return json.dumps({
+            'scan': scan, 'boxes': boxes, 'fsm_state': fsm,
+            'parada_dist': pd,
+            'dist_frente': round(df, 4) if math.isfinite(df) else None,
+            'robot_pose': {'x': round(px, 4), 'y': round(py, 4), 'yaw': round(pyaw, 4)},
+            'metrics': met, 'ts': round(time.time(), 3),
+        }, separators=(',', ':'))
+
+    @staticmethod
+    def _get_local_ip() -> str:
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8', 80)); ip = s.getsockname()[0]; s.close(); return ip
+        except Exception: return 'localhost'
+
+    def destroy_node(self):
+        self._kill_all(); self._server.shutdown(); super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    nodo = WebMonitorNode()
+    try: rclpy.spin(nodo)
+    except KeyboardInterrupt: pass
+    finally: nodo.destroy_node(); rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
